@@ -381,7 +381,15 @@ def get_endpoint_status(
     ep = db.get(EndpointModel, endpoint_id)
     if not ep:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Endpoint not found")
-    last_scan = db.scalar(
+    active_scan = db.scalar(
+        select(ScanJobModel)
+        .where(
+            ScanJobModel.endpoint_id == ep.id,
+            ScanJobModel.status.in_(["collecting", "processing"]),
+        )
+        .order_by(ScanJobModel.created_at.desc())
+    )
+    last_scan = active_scan or db.scalar(
         select(ScanJobModel).where(ScanJobModel.endpoint_id == ep.id).order_by(ScanJobModel.created_at.desc())
     )
     return {
@@ -421,23 +429,30 @@ def agent_next_job(
 ):
     _, ep = agent_ep
     ep.last_seen = utc_now_str()
-    # Recover interrupted collecting jobs or claim next queued scan for this endpoint
-    job = db.scalar(
+    # Claim the newest queued/collecting scan for this endpoint, and automatically supersede any older stale queued duplicates
+    pending_jobs = db.scalars(
         select(ScanJobModel)
         .where(
             ScanJobModel.endpoint_id == ep.id,
             ScanJobModel.status.in_(["queued", "collecting"]),
             ScanJobModel.cancel_requested == False,  # noqa: E712
         )
-        .order_by(ScanJobModel.created_at.asc())
-    )
-    if not job:
+        .order_by(ScanJobModel.created_at.desc())
+    ).all()
+    if not pending_jobs:
         db.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    job = pending_jobs[0]
+    now = utc_now_str()
+    for stale_job in pending_jobs[1:]:
+        stale_job.status = "cancelled"
+        stale_job.cancel_requested = True
+        stale_job.finished_at = now
+
     job.status = "collecting"
     if not job.started_at:
-        job.started_at = utc_now_str()
+        job.started_at = now
     db.commit()
     return {
         "scan_id": job.id,
@@ -582,19 +597,34 @@ def create_scan(
     if not ep:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Endpoint not found")
 
-    # If an identical scan is already queued or actively running for this investigation, return it rather than stacking duplicates
-    active_existing = db.scalar(
+    # Cancel any older stale queued scans for this investigation so the newly requested scan executes immediately
+    stale_queued = db.scalars(
+        select(ScanJobModel).where(
+            ScanJobModel.investigation_id == inv.id,
+            ScanJobModel.endpoint_id == ep.id,
+            ScanJobModel.status == "queued",
+        )
+    ).all()
+    now_str = utc_now_str()
+    for sq in stale_queued:
+        sq.status = "cancelled"
+        sq.cancel_requested = True
+        sq.finished_at = now_str
+
+    # If a scan is already actively collecting or processing right now, return it
+    active_running = db.scalar(
         select(ScanJobModel)
         .where(
             ScanJobModel.investigation_id == inv.id,
             ScanJobModel.endpoint_id == ep.id,
-            ScanJobModel.status.in_(["queued", "collecting", "processing"]),
+            ScanJobModel.status.in_(["collecting", "processing"]),
             ScanJobModel.cancel_requested == False,  # noqa: E712
         )
         .order_by(ScanJobModel.created_at.desc())
     )
-    if active_existing:
-        return _serialize_scan(active_existing)
+    if active_running:
+        db.commit()
+        return _serialize_scan(active_running)
 
     srcs = body.sources or ["evtx", "registry", "prefetch", "amcache", "browser", "filesystem"]
     initial_stages = [
@@ -773,13 +803,38 @@ def get_investigation_summary(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     inv = check_investigation_access(db, inv_id, user)
-    artifacts = db.scalars(select(CollectedArtifactModel).where(CollectedArtifactModel.investigation_id == inv.id)).all()
+    active_scan = db.scalar(
+        select(ScanJobModel)
+        .where(
+            ScanJobModel.investigation_id == inv.id,
+            ScanJobModel.status.in_(["collecting", "processing", "queued"]),
+        )
+        .order_by(ScanJobModel.created_at.desc())
+    )
+    latest_finished_scan = db.scalar(
+        select(ScanJobModel)
+        .where(
+            ScanJobModel.investigation_id == inv.id,
+            ScanJobModel.status.in_(["completed", "partial"]),
+        )
+        .order_by(ScanJobModel.created_at.desc())
+    )
+    latest_scan = active_scan or latest_finished_scan or db.scalar(
+        select(ScanJobModel).where(ScanJobModel.investigation_id == inv.id).order_by(ScanJobModel.created_at.desc())
+    )
+    # Scope artifact counts to the latest completed/partial scan (or active scan) so numbers don't multiply across historical scans
+    target_scan_id = (latest_finished_scan or latest_scan).id if (latest_finished_scan or latest_scan) else None
+    if target_scan_id:
+        artifacts = db.scalars(
+            select(CollectedArtifactModel).where(CollectedArtifactModel.scan_id == target_scan_id)
+        ).all()
+    else:
+        artifacts = db.scalars(
+            select(CollectedArtifactModel).where(CollectedArtifactModel.investigation_id == inv.id)
+        ).all()
     events_total = db.scalar(select(func.count()).select_from(NormalizedEventModel).where(NormalizedEventModel.investigation_id == inv.id)) or 0
     findings_count = db.scalar(select(func.count()).select_from(AlertModel).where(AlertModel.investigation_id == inv.id)) or 0
     rels = db.scalars(select(EvidenceRelationshipModel).where(EvidenceRelationshipModel.investigation_id == inv.id)).all()
-    latest_scan = db.scalar(
-        select(ScanJobModel).where(ScanJobModel.investigation_id == inv.id).order_by(ScanJobModel.created_at.desc())
-    )
 
     corr_ev_ids: set[str] = set()
     high_conf_rels = 0
