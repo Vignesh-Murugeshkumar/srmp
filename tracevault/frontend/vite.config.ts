@@ -11,7 +11,16 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': { target: BACKEND, changeOrigin: true },
-      '/ws': { target: BACKEND.replace(/^http/, 'ws'), ws: true, changeOrigin: true },
+      '/ws': {
+        target: BACKEND.replace(/^http/, 'ws'),
+        ws: true,
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('error', () => {
+            /* suppress harmless ECONNABORTED on client/server socket close */
+          });
+        },
+      },
     },
   },
   build: {
