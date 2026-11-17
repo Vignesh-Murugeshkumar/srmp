@@ -37,23 +37,12 @@ def ingest_uploaded_artifact(
     expected_orig_sha = meta.get("sha256")
     expected_rec_sha = meta.get("records_sha256")
 
-    # Remove any prior upload of the same artifact_key in this scan (idempotency for retryable uploads)
-    existing = db.scalars(
-        select(CollectedArtifactModel).where(
-            CollectedArtifactModel.scan_id == scan.id,
-            CollectedArtifactModel.artifact_key == artifact_key,
-        )
-    ).all()
-    for ex in existing:
-        db.execute(delete(ArtifactRecordModel).where(ArtifactRecordModel.artifact_id == ex.id))
-        db.delete(ex)
-    db.flush()
-
     orig_sha_actual: str | None = None
     rec_sha_actual: str | None = None
     storage_ref: str | None = None
     records_storage_ref: str | None = None
 
+    # Stream files to disk and parse NDJSON in memory BEFORE opening a SQLite write transaction
     if original_stream is not None:
         orig_sha_actual, _, storage_ref = store_stream_content_addressed(original_stream)
 
@@ -84,40 +73,12 @@ def ingest_uploaded_artifact(
         verification_status = "unverified"
 
     art_id = new_uuid()
-    artifact_row = CollectedArtifactModel(
-        id=art_id,
-        scan_id=scan.id,
-        investigation_id=scan.investigation_id,
-        endpoint_id=scan.endpoint_id,
-        artifact_key=artifact_key,
-        source=source,
-        name=str(meta.get("name") or artifact_key),
-        original_path=str(meta.get("original_path") or ""),
-        status=str(meta.get("status") or "collected"),
-        acquisition_method=str(meta.get("acquisition_method") or "collector"),
-        sha256=orig_sha_actual or expected_orig_sha,
-        records_sha256=rec_sha_actual or expected_rec_sha,
-        size_bytes=meta.get("size_bytes"),
-        last_modified=meta.get("last_modified"),
-        collected_at=str(meta.get("collected_at") or utc_now_str()),
-        collector_version=str(meta.get("collector_version") or "0.1.0"),
-        record_count=0,
-        parser=str(meta.get("parser") or "collector"),
-        side_effects=list(meta.get("side_effects") or []),
-        error=meta.get("error"),
-        time_window=meta.get("time_window"),
-        verified=verified,
-        verification_status=verification_status,
-        storage_ref=storage_ref,
-    )
-    db.add(artifact_row)
-    db.flush()
+    orig_path_str = str(meta.get("original_path") or "")
+    effective_sha = orig_sha_actual or expected_orig_sha or rec_sha_actual or expected_rec_sha
 
-    # Stream NDJSON records from content-addressed file in batches if verified or unverified (do not ingest corrupted mismatches)
-    inserted_count = 0
+    parsed_rows: list[dict[str, Any]] = []
     if records_storage_ref and verification_status != "mismatch":
         ndjson_file = resolve_storage_ref(records_storage_ref)
-        batch: list[ArtifactRecordModel] = []
         with ndjson_file.open("r", encoding="utf-8", errors="replace") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
@@ -128,30 +89,64 @@ def ingest_uploaded_artifact(
                 except json.JSONDecodeError:
                     continue
                 rec_id = str(rec_obj.get("record_id") or f"{artifact_key}:{line_no}")
-                batch.append(
-                    ArtifactRecordModel(
-                        id=new_uuid(),
-                        investigation_id=scan.investigation_id,
-                        artifact_id=art_id,
-                        artifact_key=artifact_key,
-                        source=source,
-                        record_id=rec_id,
-                        original_path=artifact_row.original_path,
-                        sha256=artifact_row.sha256 or artifact_row.records_sha256,
-                        data=rec_obj,
-                        related_event_ids=[],
-                    )
+                parsed_rows.append(
+                    {
+                        "id": new_uuid(),
+                        "investigation_id": scan.investigation_id,
+                        "artifact_id": art_id,
+                        "artifact_key": artifact_key,
+                        "source": source,
+                        "record_id": rec_id,
+                        "original_path": orig_path_str,
+                        "sha256": effective_sha,
+                        "data": rec_obj,
+                        "related_event_ids": [],
+                    }
                 )
-                inserted_count += 1
-                if len(batch) >= 500:
-                    db.add_all(batch)
-                    db.flush()
-                    batch.clear()
-        if batch:
-            db.add_all(batch)
-            db.flush()
 
-    artifact_row.record_count = inserted_count
+    inserted_count = len(parsed_rows)
+
+    # Remove any prior upload of the same artifact_key in this scan (idempotency for retryable uploads)
+    existing = db.scalars(
+        select(CollectedArtifactModel).where(
+            CollectedArtifactModel.scan_id == scan.id,
+            CollectedArtifactModel.artifact_key == artifact_key,
+        )
+    ).all()
+    for ex in existing:
+        db.execute(delete(ArtifactRecordModel).where(ArtifactRecordModel.artifact_id == ex.id))
+        db.delete(ex)
+
+    artifact_row = CollectedArtifactModel(
+        id=art_id,
+        scan_id=scan.id,
+        investigation_id=scan.investigation_id,
+        endpoint_id=scan.endpoint_id,
+        artifact_key=artifact_key,
+        source=source,
+        name=str(meta.get("name") or artifact_key),
+        original_path=orig_path_str,
+        status=str(meta.get("status") or "collected"),
+        acquisition_method=str(meta.get("acquisition_method") or "collector"),
+        sha256=orig_sha_actual or expected_orig_sha,
+        records_sha256=rec_sha_actual or expected_rec_sha,
+        size_bytes=meta.get("size_bytes"),
+        last_modified=meta.get("last_modified"),
+        collected_at=str(meta.get("collected_at") or utc_now_str()),
+        collector_version=str(meta.get("collector_version") or "0.1.0"),
+        record_count=inserted_count,
+        parser=str(meta.get("parser") or "collector"),
+        side_effects=list(meta.get("side_effects") or []),
+        error=meta.get("error"),
+        time_window=meta.get("time_window"),
+        verified=verified,
+        verification_status=verification_status,
+        storage_ref=storage_ref,
+    )
+    db.add(artifact_row)
+
+    if parsed_rows:
+        db.bulk_insert_mappings(ArtifactRecordModel, parsed_rows)
 
     # Update or create ArtifactSourceModel summary for this scan
     src_row = db.scalar(

@@ -37,6 +37,7 @@ export const CommandCenterScreen: React.FC = () => {
   const [selectedEndpointForNewInv, setSelectedEndpointForNewInv] = useState('');
   const [liveProgress, setLiveProgress] = useState<ScanProgress | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [startingScan, setStartingScan] = useState(false);
 
   const endpointsQuery = useQuery({
     queryKey: ['endpoints'],
@@ -125,8 +126,9 @@ export const CommandCenterScreen: React.FC = () => {
   };
 
   const handleStartScan = async () => {
-    if (!activeInvestigation || !endpointId) return;
+    if (!activeInvestigation || !endpointId || startingScan) return;
     setActionError(null);
+    setStartingScan(true);
     try {
       await api.startScan(endpointId, {
         investigation_id: activeInvestigation.id,
@@ -138,6 +140,8 @@ export const CommandCenterScreen: React.FC = () => {
       await qc.invalidateQueries({ queryKey: ['endpointStatus', endpointId] });
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to queue scan');
+    } finally {
+      setStartingScan(false);
     }
   };
 
@@ -309,11 +313,15 @@ export const CommandCenterScreen: React.FC = () => {
             <div className="flex space-x-2">
               <button
                 type="button"
-                disabled={!activeInvestigation || !endpointId || selectedSources.length === 0}
+                disabled={!activeInvestigation || !endpointId || selectedSources.length === 0 || startingScan || isScanActive}
                 onClick={handleStartScan}
                 className="flex-1 bg-accent text-bg font-mono font-semibold text-xs uppercase py-2 hover:bg-accent/90 disabled:opacity-40"
               >
-                Start {scanType === 'quick' ? 'Quick' : 'Full'} Scan
+                {startingScan
+                  ? 'Queueing...'
+                  : isScanActive
+                    ? `Scan ${activeScanStatus}...`
+                    : `Start ${scanType === 'quick' ? 'Quick' : 'Full'} Scan`}
               </button>
               {effectiveProgress &&
                 ['queued', 'collecting'].includes(effectiveProgress.scan.status) && (

@@ -10,9 +10,10 @@ from .config import settings
 
 
 def _make_engine(db_url: str):
-    connect_args = {}
+    connect_args: dict[str, object] = {}
     if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        connect_args["timeout"] = 60.0
     eng = create_engine(db_url, connect_args=connect_args, future=True)
     if db_url.startswith("sqlite"):
         @event.listens_for(eng, "connect")
@@ -20,7 +21,7 @@ def _make_engine(db_url: str):
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.execute("PRAGMA busy_timeout=60000")
             cursor.close()
     return eng
 

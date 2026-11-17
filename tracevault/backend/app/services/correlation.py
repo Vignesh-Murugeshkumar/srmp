@@ -72,12 +72,6 @@ def _event_timeline_group(ev: NormalizedEventModel) -> str:
 
 def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[str, int]:
     """Extract evidence entities, construct deterministic relationships, and populate timeline_events."""
-    db.execute(delete(CorrelationModel).where(CorrelationModel.investigation_id == investigation_id))
-    db.execute(delete(EvidenceRelationshipModel).where(EvidenceRelationshipModel.investigation_id == investigation_id))
-    db.execute(delete(TimelineEventModel).where(TimelineEventModel.investigation_id == investigation_id))
-    db.execute(delete(EvidenceEntityModel).where(EvidenceEntityModel.investigation_id == investigation_id))
-    db.flush()
-
     events = db.scalars(
         select(NormalizedEventModel).where(NormalizedEventModel.investigation_id == investigation_id)
     ).all()
@@ -110,7 +104,6 @@ def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[
                 risk_score=25.0 if ev.suspicious else 0.0,
             )
             entities_by_key[map_key] = ent
-            db.add(ent)
         else:
             if ev.artifact_source not in ent.sources:
                 ent.sources = [*ent.sources, ev.artifact_source]
@@ -170,7 +163,6 @@ def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[
                 supporting_artifact_ids=art_ids,
             )
             relationships_by_sig[sig] = rel
-            db.add(rel)
             correlations_to_add.append(
                 CorrelationModel(
                     id=new_uuid(),
@@ -724,39 +716,42 @@ def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[
                     [dl_ev, *exe_evs],
                 )
 
-    db.flush()
+    # Populate TimelineEventModel rows with linked entity_ids in memory, then perform a single short SQLite write transaction
+    timeline_rows: list[TimelineEventModel] = [
+        TimelineEventModel(
+            id=ev.event_id,
+            investigation_id=investigation_id,
+            normalized_event_id=ev.event_id,
+            timestamp=ev.timestamp,
+            timestamp_precision=ev.timestamp_precision,
+            group=_event_timeline_group(ev),
+            event_type=ev.event_type,
+            artifact_source=ev.artifact_source,
+            summary=ev.summary,
+            suspicious=ev.suspicious,
+            severity=ev.severity,
+            entity_ids=sorted(event_entity_map.get(ev.event_id, set())),
+            source_record_id=ev.source_record_id,
+            source_artifact_id=ev.source_artifact_id,
+        )
+        for ev in events
+    ]
+
+    db.execute(delete(CorrelationModel).where(CorrelationModel.investigation_id == investigation_id))
+    db.execute(delete(EvidenceRelationshipModel).where(EvidenceRelationshipModel.investigation_id == investigation_id))
+    db.execute(delete(TimelineEventModel).where(TimelineEventModel.investigation_id == investigation_id))
+    db.execute(delete(EvidenceEntityModel).where(EvidenceEntityModel.investigation_id == investigation_id))
+
+    if entities_by_key:
+        db.add_all(list(entities_by_key.values()))
+        db.flush()
+    if relationships_by_sig:
+        db.add_all(list(relationships_by_sig.values()))
+        db.flush()
     if correlations_to_add:
         db.add_all(correlations_to_add)
-        db.flush()
-
-    # Populate TimelineEventModel rows with linked entity_ids
-    timeline_rows: list[TimelineEventModel] = []
-    for ev in events:
-        timeline_rows.append(
-            TimelineEventModel(
-                id=ev.event_id,
-                investigation_id=investigation_id,
-                normalized_event_id=ev.event_id,
-                timestamp=ev.timestamp,
-                timestamp_precision=ev.timestamp_precision,
-                group=_event_timeline_group(ev),
-                event_type=ev.event_type,
-                artifact_source=ev.artifact_source,
-                summary=ev.summary,
-                suspicious=ev.suspicious,
-                severity=ev.severity,
-                entity_ids=sorted(event_entity_map.get(ev.event_id, set())),
-                source_record_id=ev.source_record_id,
-                source_artifact_id=ev.source_artifact_id,
-            )
-        )
-        if len(timeline_rows) >= 500:
-            db.add_all(timeline_rows)
-            db.flush()
-            timeline_rows.clear()
     if timeline_rows:
         db.add_all(timeline_rows)
-        db.flush()
 
     db.commit()
     return {

@@ -446,9 +446,6 @@ def _normalize_filesystem_record(rec: ArtifactRecordModel, endpoint_id: str) -> 
 
 def normalize_investigation_records(db: Session, investigation_id: str, endpoint_id: str) -> int:
     """Normalize all `artifact_records` for an investigation into `normalized_events`."""
-    db.execute(delete(NormalizedEventModel).where(NormalizedEventModel.investigation_id == investigation_id))
-    db.flush()
-
     records = db.scalars(
         select(ArtifactRecordModel).where(ArtifactRecordModel.investigation_id == investigation_id)
     ).all()
@@ -470,14 +467,10 @@ def normalize_investigation_records(db: Session, investigation_id: str, endpoint
 
         rec.related_event_ids = [ev.event_id]
         events.append(ev)
-        if len(events) >= 500:
-            db.add_all(events)
-            db.flush()
-            events.clear()
 
+    # Keep the SQLite write lock window as short as possible
+    db.execute(delete(NormalizedEventModel).where(NormalizedEventModel.investigation_id == investigation_id))
     if events:
         db.add_all(events)
-        db.flush()
-
     db.commit()
     return len(records)

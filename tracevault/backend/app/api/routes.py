@@ -581,6 +581,21 @@ def create_scan(
     ep = db.get(EndpointModel, endpoint_id)
     if not ep:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Endpoint not found")
+
+    # If an identical scan is already queued or actively running for this investigation, return it rather than stacking duplicates
+    active_existing = db.scalar(
+        select(ScanJobModel)
+        .where(
+            ScanJobModel.investigation_id == inv.id,
+            ScanJobModel.endpoint_id == ep.id,
+            ScanJobModel.status.in_(["queued", "collecting", "processing"]),
+            ScanJobModel.cancel_requested == False,  # noqa: E712
+        )
+        .order_by(ScanJobModel.created_at.desc())
+    )
+    if active_existing:
+        return _serialize_scan(active_existing)
+
     srcs = body.sources or ["evtx", "registry", "prefetch", "amcache", "browser", "filesystem"]
     initial_stages = [
         {"stage": s, "status": "pending", "records": 0, "progress": 0.0, "duration_ms": 0, "errors": [], "message": "Queued for endpoint agent"}
