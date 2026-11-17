@@ -6,16 +6,142 @@ otherwise falls back to honest metadata-only inspection (without fabricating run
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
 from .. import __version__
-from ..utils import safe_artifact_filename, sha256_file, stat_info, unix_ts_to_iso, utc_now_iso, write_ndjson_records
+from ..utils import (
+    filetime_to_iso,
+    safe_artifact_filename,
+    sha256_file,
+    stat_info,
+    unix_ts_to_iso,
+    utc_now_iso,
+    write_ndjson_records,
+)
+
+
+def decompress_mam_prefetch(raw: bytes) -> bytes | None:
+    """Decompress a Windows 10/11 MAM-compressed .pf file using native ntdll.RtlDecompressBufferEx."""
+    if len(raw) < 8 or raw[:3] != b"MAM":
+        if len(raw) >= 8 and raw[4:8] == b"SCCA":
+            return raw
+        return None
+    if os.name != "nt":
+        return None
+    uncompressed_size = struct.unpack_from("<I", raw, 4)[0]
+    if uncompressed_size <= 0 or uncompressed_size > 32 * 1024 * 1024:
+        return None
+    # MAM header is 8 bytes (or 12 bytes if checksum flag 0x80 is set in byte 3)
+    has_crc = bool(raw[3] & 0x80)
+    header_len = 12 if has_crc else 8
+    compressed_buf = raw[header_len:]
+    try:
+        ntdll = ctypes.windll.ntdll
+        # COMPRESSION_FORMAT_XPRESS_HUFF = 4
+        fmt = 4
+        ws_buf_size = ctypes.c_ulong(0)
+        frag_ws_size = ctypes.c_ulong(0)
+        status = ntdll.RtlGetCompressionWorkSpaceSize(
+            ctypes.c_ushort(fmt),
+            ctypes.byref(ws_buf_size),
+            ctypes.byref(frag_ws_size),
+        )
+        if status != 0:
+            return None
+        workspace = ctypes.create_string_buffer(ws_buf_size.value)
+        out_buf = ctypes.create_string_buffer(uncompressed_size)
+        final_size = ctypes.c_ulong(0)
+        status = ntdll.RtlDecompressBufferEx(
+            ctypes.c_ushort(fmt),
+            out_buf,
+            ctypes.c_ulong(uncompressed_size),
+            ctypes.c_char_p(compressed_buf),
+            ctypes.c_ulong(len(compressed_buf)),
+            ctypes.byref(final_size),
+            workspace,
+        )
+        if status == 0 and final_size.value > 0:
+            return out_buf.raw[: final_size.value]
+    except Exception:
+        return None
+    return None
+
+
+def parse_scca_prefetch_bytes(data: bytes, pf_path: str) -> dict[str, Any] | None:
+    """Parse an uncompressed SCCA Windows Prefetch buffer (versions 23, 26, 30 / Win8.1-Win11)."""
+    buf = decompress_mam_prefetch(data) if data[:3] == b"MAM" else data
+    if not buf or len(buf) < 0x100 or buf[4:8] != b"SCCA":
+        return None
+
+    version = struct.unpack_from("<I", buf, 0)[0]
+    raw_exe = buf[16:76].decode("utf-16-le", errors="replace").split("\x00", 1)[0]
+    pf_hash = f"{struct.unpack_from('<I', buf, 76)[0]:08X}"
+
+    # File metrics & filename strings table offsets inside SCCA header (offset 84)
+    fn_strings_offset = struct.unpack_from("<I", buf, 100)[0]
+    fn_strings_size = struct.unpack_from("<I", buf, 104)[0]
+
+    # FileInformation block begins at offset 84; last_run_times (8 x FILETIME = 64 bytes) sits at offset 128 (0x80)
+    last_run_times: list[str] = []
+    for i in range(8):
+        ft = struct.unpack_from("<Q", buf, 128 + i * 8)[0]
+        iso = filetime_to_iso(ft)
+        if iso:
+            last_run_times.append(iso)
+
+    # Run count in SCCA v30 (Win10/11) is at offset 208 (0xD0) or 204 (0xCC) depending on build; in v26 at 208
+    run_count: int | None = None
+    if version == 30 and len(buf) >= 216:
+        rc_a = struct.unpack_from("<I", buf, 208)[0]
+        rc_b = struct.unpack_from("<I", buf, 204)[0]
+        if 0 < rc_a < 1000000:
+            run_count = int(rc_a)
+        elif 0 < rc_b < 1000000:
+            run_count = int(rc_b)
+    elif version in (23, 26) and len(buf) >= 212:
+        rc = struct.unpack_from("<I", buf, 208)[0]
+        if 0 < rc < 1000000:
+            run_count = int(rc)
+
+    referenced_files: list[str] = []
+    if 0 < fn_strings_offset < len(buf) and fn_strings_size > 0:
+        end_off = min(len(buf), fn_strings_offset + fn_strings_size)
+        raw_strings = buf[fn_strings_offset:end_off].decode("utf-16-le", errors="replace")
+        for s in raw_strings.split("\x00"):
+            s_clean = s.strip()
+            if s_clean:
+                # Normalize \VOLUME{...}\ paths to C:\ when possible for cleaner correlation
+                s_norm = re.sub(r"^\\VOLUME\{[^}]+\}\\", r"C:\\", s_clean, flags=re.IGNORECASE)
+                s_norm = re.sub(r"^\\DEVICE\\HARDDISKVOLUME\d+\\", r"C:\\", s_norm, flags=re.IGNORECASE)
+                referenced_files.append(s_norm)
+
+    referenced_dirs = sorted({str(Path(f).parent) for f in referenced_files[:100] if "\\" in f})
+
+    return {
+        "record_id": f"prefetch:{Path(pf_path).name}",
+        "source": "prefetch",
+        "executable": raw_exe or parse_prefetch_filename(Path(pf_path).name)[0],
+        "prefetch_hash": pf_hash,
+        "pf_path": pf_path,
+        "pf_created": None,
+        "pf_modified": None,
+        "timestamp_precision": "100ns",
+        "run_count": run_count,
+        "last_run_times": last_run_times,
+        "referenced_files": referenced_files[:150],
+        "referenced_dirs": referenced_dirs[:50],
+        "volume_serials": [],
+        "parser": "native-scca-mam",
+    }
 
 
 def _find_pecmd() -> str | None:
@@ -84,10 +210,17 @@ def _iter_prefetch_records(pf_files: list[Path], pecmd_bin: str | None) -> Itera
             except Exception:
                 pass
 
-    # Fallback: metadata-only inspection (does not infer run counts beyond filesystem timestamps)
+    # Native SCCA / MAM binary parser (parses run_count, 8 last_run_times, and referenced_files directly from .pf bytes)
     for pf in pf_files:
         try:
             st = pf.stat()
+            raw_bytes = pf.read_bytes()
+            parsed = parse_scca_prefetch_bytes(raw_bytes, str(pf))
+            if parsed is not None:
+                parsed["pf_created"] = unix_ts_to_iso(st.st_ctime)
+                parsed["pf_modified"] = unix_ts_to_iso(st.st_mtime)
+                yield parsed
+                continue
             exe, pf_hash = parse_prefetch_filename(pf.name)
             yield {
                 "record_id": f"prefetch:{pf.name}",

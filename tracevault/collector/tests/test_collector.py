@@ -16,7 +16,10 @@ from tracevault_collector.collectors.browser import (
 )
 from tracevault_collector.collectors.evtx import parse_evtx_xml
 from tracevault_collector.collectors.filesystem import parse_recycle_bin_i_bytes
-from tracevault_collector.collectors.prefetch import parse_prefetch_filename
+from tracevault_collector.collectors.prefetch import (
+    parse_prefetch_filename,
+    parse_scca_prefetch_bytes,
+)
 from tracevault_collector.collectors.registry import decode_userassist_entry
 from tracevault_collector.discovery import discover_artifacts
 from tracevault_collector.identity import identify_endpoint
@@ -160,6 +163,28 @@ def test_ndjson_writer_and_prefetch_filename(tmp_path: Path) -> None:
     exe, pf_hash = parse_prefetch_filename("POWERSHELL.EXE-A1B2C3D4.pf")
     assert exe == "POWERSHELL.EXE"
     assert pf_hash == "A1B2C3D4"
+
+    # Build a synthetic SCCA v30 Prefetch binary buffer and verify full binary parsing
+    scca = bytearray(512)
+    struct.pack_into("<I", scca, 0, 30)  # version 30
+    scca[4:8] = b"SCCA"
+    exe_utf16 = "POWERSHELL.EXE\x00".encode("utf-16-le")
+    scca[16 : 16 + len(exe_utf16)] = exe_utf16
+    struct.pack_into("<I", scca, 76, 0xA1B2C3D4)
+    fn_str = "\\VOLUME{01d9}\\WINDOWS\\SYSTEM32\\POWERSHELL.EXE\x00\\VOLUME{01d9}\\USERS\\VIGNESH\\PAYLOAD.PS1\x00".encode("utf-16-le")
+    struct.pack_into("<I", scca, 100, 260)  # filename strings offset
+    struct.pack_into("<I", scca, 104, len(fn_str))
+    struct.pack_into("<Q", scca, 128, 133761024000000000)  # last_run_times[0]
+    struct.pack_into("<I", scca, 208, 9)  # run_count = 9
+    scca[260 : 260 + len(fn_str)] = fn_str
+
+    parsed_pf = parse_scca_prefetch_bytes(bytes(scca), r"C:\Windows\Prefetch\POWERSHELL.EXE-A1B2C3D4.pf")
+    assert parsed_pf is not None
+    assert parsed_pf["executable"] == "POWERSHELL.EXE"
+    assert parsed_pf["prefetch_hash"] == "A1B2C3D4"
+    assert parsed_pf["run_count"] == 9
+    assert parsed_pf["last_run_times"] == ["2024-11-15T00:00:00+00:00"]
+    assert r"C:\WINDOWS\SYSTEM32\POWERSHELL.EXE" in parsed_pf["referenced_files"]
 
     ndjson_file = tmp_path / "records.ndjson"
     recs = [{"record_id": "1", "source": "evtx"}, {"record_id": "2", "source": "evtx"}]
