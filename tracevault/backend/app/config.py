@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     task_mode: str = "inline"  # "inline" or "celery"
     redis_url: str = "redis://127.0.0.1:6379/0"
     correlation_window_seconds: int = 300  # 5 min proximity boost window
-    graph_max_nodes: int = 1500
+    graph_max_nodes: int = 250
 
 
 settings = Settings()

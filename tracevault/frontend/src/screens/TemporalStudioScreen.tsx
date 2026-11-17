@@ -218,8 +218,8 @@ export const TemporalStudioScreen: React.FC = () => {
               );
             })}
 
-            {/* Event ticks */}
-            {timedEvents.map(({ ev, ms }) => {
+            {/* Event ticks (capped at 600 SVG nodes for instant switching on 5k-event scans) */}
+            {timedEvents.slice(0, 600).map(({ ev, ms }) => {
               const laneIdx = Math.max(0, TIMELINE_GROUPS.indexOf(ev.group));
               const cy = 28 + laneIdx * 30;
               const cx = xScale(new Date(ms));

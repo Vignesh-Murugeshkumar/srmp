@@ -124,6 +124,18 @@ export const EvidenceUniverseScreen: React.FC = () => {
     };
   }, [graphQuery.data, searchText]);
 
+  // Destroy Cytoscape instance cleanly on component unmount
+  useEffect(() => {
+    return () => {
+      try {
+        cyRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
+      cyRef.current = null;
+    };
+  }, []);
+
   // Mount & update Cytoscape instance
   useEffect(() => {
     if (!containerRef.current || !filteredGraph) return;
@@ -253,10 +265,13 @@ export const EvidenceUniverseScreen: React.FC = () => {
       cyRef.current.add(elements);
     }
 
+    const nodeCount = filteredGraph.nodes.length;
     const layoutConfig =
       viewMode === 'process_tree'
         ? { name: 'dagre', rankDir: 'LR', nodeSep: 45, rankSep: 90, animate: false }
-        : { name: 'cose', idealEdgeLength: 90, nodeOverlap: 20, animate: false };
+        : nodeCount > 120
+          ? { name: 'concentric', minNodeSpacing: 28, animate: false }
+          : { name: 'cose', idealEdgeLength: 90, nodeOverlap: 20, numIter: 250, animate: false };
 
     try {
       cyRef.current.layout(layoutConfig as never).run();

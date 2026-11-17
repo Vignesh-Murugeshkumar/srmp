@@ -78,10 +78,12 @@ export const CommandCenterScreen: React.FC = () => {
     },
   });
 
-  // Subscribe to WebSocket scan progress when a scan is active
+  const activeScanStatus = summaryQuery.data?.latest_scan?.status ?? epStatusQuery.data?.last_scan?.status ?? null;
+  const isScanActive = activeScanStatus !== null && ['queued', 'collecting', 'processing'].includes(activeScanStatus);
+
+  // Subscribe to WebSocket scan progress ONLY while a scan is actively running
   useEffect(() => {
-    if (!activeScanId) {
-      setLiveProgress(null);
+    if (!activeScanId || !isScanActive) {
       return;
     }
     let ws: WebSocket | null = null;
@@ -106,12 +108,14 @@ export const CommandCenterScreen: React.FC = () => {
     }
     return () => {
       try {
-        ws?.close();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
       } catch {
         /* ignore */
       }
     };
-  }, [activeScanId, activeInvestigation?.id, qc]);
+  }, [activeScanId, isScanActive, activeInvestigation?.id, qc]);
 
   const effectiveProgress = liveProgress ?? scanProgressQuery.data ?? null;
   const activeEndpoint = endpointsQuery.data?.find((e) => e.id === endpointId) ?? null;
