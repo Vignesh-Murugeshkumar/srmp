@@ -1,0 +1,6 @@
+"""TraceVault Backend Application."""
+
+__version__ = "0.1.0"
+NORMALIZATION_SCHEMA_VERSION = "1.0.0"
+CORRELATION_RULES_VERSION = "1.0.0"
+DETECTION_RULES_VERSION = "1.0.0"

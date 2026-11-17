@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tracevault
+      POSTGRES_PASSWORD: tracevault-db-password
+      POSTGRES_DB: tracevault
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    environment:
+      TRACEVAULT_DATABASE_URL: postgresql+psycopg://tracevault:tracevault-db-password@postgres:5432/tracevault
+      TRACEVAULT_REDIS_URL: redis://redis:6379/0
+      TRACEVAULT_TASK_MODE: celery
+      TRACEVAULT_SECRET_KEY: change-me-in-production
+      TRACEVAULT_ENROLLMENT_KEY: dev-enrollment-key
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - evidence_store:/app/evidence_store
+
+  worker:
+    build: ./backend
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    environment:
+      TRACEVAULT_DATABASE_URL: postgresql+psycopg://tracevault:tracevault-db-password@postgres:5432/tracevault
+      TRACEVAULT_REDIS_URL: redis://redis:6379/0
+      TRACEVAULT_TASK_MODE: celery
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - evidence_store:/app/evidence_store
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  evidence_store:
