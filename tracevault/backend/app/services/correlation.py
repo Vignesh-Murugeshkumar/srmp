@@ -23,6 +23,7 @@ from ..models import (
     NormalizedEventModel,
     TimelineEventModel,
     new_uuid,
+    utc_now_str,
 )
 from .normalization import win_basename
 
@@ -717,23 +718,23 @@ def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[
                 )
 
     # Populate TimelineEventModel rows with linked entity_ids in memory, then perform a single short SQLite write transaction
-    timeline_rows: list[TimelineEventModel] = [
-        TimelineEventModel(
-            id=ev.event_id,
-            investigation_id=investigation_id,
-            normalized_event_id=ev.event_id,
-            timestamp=ev.timestamp,
-            timestamp_precision=ev.timestamp_precision,
-            group=_event_timeline_group(ev),
-            event_type=ev.event_type,
-            artifact_source=ev.artifact_source,
-            summary=ev.summary,
-            suspicious=ev.suspicious,
-            severity=ev.severity,
-            entity_ids=sorted(event_entity_map.get(ev.event_id, set())),
-            source_record_id=ev.source_record_id,
-            source_artifact_id=ev.source_artifact_id,
-        )
+    timeline_mappings: list[dict[str, Any]] = [
+        {
+            "id": ev.event_id,
+            "investigation_id": investigation_id,
+            "normalized_event_id": ev.event_id,
+            "timestamp": ev.timestamp,
+            "timestamp_precision": ev.timestamp_precision,
+            "group": _event_timeline_group(ev),
+            "event_type": ev.event_type,
+            "artifact_source": ev.artifact_source,
+            "summary": ev.summary,
+            "suspicious": ev.suspicious,
+            "severity": ev.severity,
+            "entity_ids": sorted(event_entity_map.get(ev.event_id, set())),
+            "source_record_id": ev.source_record_id,
+            "source_artifact_id": ev.source_artifact_id,
+        }
         for ev in events
     ]
 
@@ -743,15 +744,63 @@ def build_entities_and_correlations(db: Session, investigation_id: str) -> dict[
     db.execute(delete(EvidenceEntityModel).where(EvidenceEntityModel.investigation_id == investigation_id))
 
     if entities_by_key:
-        db.add_all(list(entities_by_key.values()))
-        db.flush()
+        entity_mappings = [
+            {
+                "id": e.id,
+                "investigation_id": e.investigation_id,
+                "type": e.type,
+                "key": e.key,
+                "label": e.label,
+                "properties": e.properties,
+                "sources": e.sources,
+                "first_seen": e.first_seen,
+                "last_seen": e.last_seen,
+                "suspicious": e.suspicious,
+                "risk_score": e.risk_score,
+            }
+            for e in entities_by_key.values()
+        ]
+        db.bulk_insert_mappings(EvidenceEntityModel, entity_mappings)
+
     if relationships_by_sig:
-        db.add_all(list(relationships_by_sig.values()))
-        db.flush()
+        rel_mappings = [
+            {
+                "id": r.id,
+                "investigation_id": r.investigation_id,
+                "source_id": r.source_id,
+                "target_id": r.target_id,
+                "type": r.type,
+                "evidence_class": r.evidence_class,
+                "correlation_method": r.correlation_method,
+                "confidence": r.confidence,
+                "explanation": r.explanation,
+                "timestamp": r.timestamp,
+                "supporting_event_ids": r.supporting_event_ids,
+                "supporting_artifact_ids": r.supporting_artifact_ids,
+            }
+            for r in relationships_by_sig.values()
+        ]
+        db.bulk_insert_mappings(EvidenceRelationshipModel, rel_mappings)
+
     if correlations_to_add:
-        db.add_all(correlations_to_add)
-    if timeline_rows:
-        db.add_all(timeline_rows)
+        corr_mappings = [
+            {
+                "id": c.id,
+                "investigation_id": c.investigation_id,
+                "relationship_id": c.relationship_id,
+                "rule_id": c.rule_id,
+                "rule_version": c.rule_version,
+                "confidence": c.confidence,
+                "explanation": c.explanation,
+                "supporting_event_ids": c.supporting_event_ids,
+                "created_at": c.created_at or utc_now_str(),
+            }
+            for c in correlations_to_add
+        ]
+        db.bulk_insert_mappings(CorrelationModel, corr_mappings)
+
+    if timeline_mappings:
+        db.bulk_insert_mappings(TimelineEventModel, timeline_mappings)
 
     db.commit()
     return {

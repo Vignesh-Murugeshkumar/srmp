@@ -54,8 +54,8 @@ def execute_processing_pipeline(db: Session, scan_id: str) -> dict[str, Any]:
     scan.stages = stages
     db.commit()
 
-    # 1. Normalize records -> normalized_events
-    norm_count = normalize_investigation_records(db, inv.id, scan.endpoint_id)
+    # 1. Normalize records -> normalized_events (scope to the current scan's artifacts)
+    norm_count = normalize_investigation_records(db, inv.id, scan.endpoint_id, scan_id=scan.id)
 
     # 2. Extract entities, build relationships, and populate timeline_events
     corr_stats = build_entities_and_correlations(db, inv.id)

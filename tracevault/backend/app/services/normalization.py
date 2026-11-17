@@ -444,11 +444,18 @@ def _normalize_filesystem_record(rec: ArtifactRecordModel, endpoint_id: str) -> 
     )
 
 
-def normalize_investigation_records(db: Session, investigation_id: str, endpoint_id: str) -> int:
-    """Normalize all `artifact_records` for an investigation into `normalized_events`."""
-    records = db.scalars(
-        select(ArtifactRecordModel).where(ArtifactRecordModel.investigation_id == investigation_id)
-    ).all()
+def normalize_investigation_records(
+    db: Session,
+    investigation_id: str,
+    endpoint_id: str,
+    scan_id: str | None = None,
+) -> int:
+    """Normalize `artifact_records` for an investigation (scoped to `scan_id` when provided) into `normalized_events`."""
+    stmt = select(ArtifactRecordModel).where(ArtifactRecordModel.investigation_id == investigation_id)
+    if scan_id:
+        scan_art_ids = select(CollectedArtifactModel.id).where(CollectedArtifactModel.scan_id == scan_id)
+        stmt = stmt.where(ArtifactRecordModel.artifact_id.in_(scan_art_ids))
+    records = db.scalars(stmt).all()
 
     events: list[NormalizedEventModel] = []
     for rec in records:
@@ -468,9 +475,36 @@ def normalize_investigation_records(db: Session, investigation_id: str, endpoint
         rec.related_event_ids = [ev.event_id]
         events.append(ev)
 
-    # Keep the SQLite write lock window as short as possible
+    # Keep the SQLite write lock window as short as possible using bulk_insert_mappings
     db.execute(delete(NormalizedEventModel).where(NormalizedEventModel.investigation_id == investigation_id))
     if events:
-        db.add_all(events)
+        event_mappings = [
+            {
+                "event_id": ev.event_id,
+                "investigation_id": ev.investigation_id,
+                "endpoint_id": ev.endpoint_id,
+                "artifact_source": ev.artifact_source,
+                "event_type": ev.event_type,
+                "timestamp": ev.timestamp,
+                "timestamp_precision": ev.timestamp_precision,
+                "timezone": ev.timezone,
+                "user_identifier": ev.user_identifier,
+                "process_identifier": ev.process_identifier,
+                "process_name": ev.process_name,
+                "file_path": ev.file_path,
+                "registry_path": ev.registry_path,
+                "network_indicator": ev.network_indicator,
+                "source_artifact_id": ev.source_artifact_id,
+                "source_record_id": ev.source_record_id,
+                "evidence_reference": ev.evidence_reference,
+                "confidence": ev.confidence,
+                "raw_metadata": ev.raw_metadata,
+                "summary": ev.summary,
+                "suspicious": ev.suspicious,
+                "severity": ev.severity,
+            }
+            for ev in events
+        ]
+        db.bulk_insert_mappings(NormalizedEventModel, event_mappings)
     db.commit()
     return len(records)

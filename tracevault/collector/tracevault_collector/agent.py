@@ -223,10 +223,11 @@ class CollectorClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         url = f"{self.server_url}{path}"
+        req_timeout = kwargs.pop("timeout", self.timeout)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                resp = self.session.request(method, url, timeout=req_timeout, **kwargs)
                 if resp.status_code in (502, 503, 504) and attempt + 1 < self.max_retries:
                     time.sleep(0.5 * (2**attempt))
                     continue
@@ -339,6 +340,7 @@ class CollectorClient:
                 "limitations": limitations,
                 "side_effects": side_effects,
             },
+            timeout=max(self.timeout, 180.0),
         )
         resp.raise_for_status()
         return resp.json()
